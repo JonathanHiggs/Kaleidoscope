@@ -7,6 +7,21 @@
 #include <utility>
 #include <vector>
 
+#include <llvm/ADT/APFloat.h>
+#include <llvm/ADT/STLExtras.h>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Type.h>
+#include <llvm/IR/Verifier.h>
+
+using namespace llvm;
+
+
 //===----------------------------------------------------------------------===//
 // Lexer
 //===----------------------------------------------------------------------===//
@@ -89,87 +104,95 @@ static int gettok()
 // Abstract Syntax Tree (aka Parse Tree)
 //===----------------------------------------------------------------------===//
 
-namespace
+
+/// ExprAST - Base class for all expression nodes.
+class ExprAST
 {
+public:
+    virtual ~ExprAST() = default;
+    virtual Value *codegen() = 0;
+};
 
-    /// ExprAST - Base class for all expression nodes.
-    class ExprAST
-    {
-    public:
-        virtual ~ExprAST() = default;
-        virtual Value *codefen() = 0;
-    };
+/// NumberExprAST - Expression class for numeric literals like "1.0".
+class NumberExprAST : public ExprAST
+{
+    double Val;
 
-    /// NumberExprAST - Expression class for numeric literals like "1.0".
-    class NumberExprAST : public ExprAST
-    {
-        double Val;
+public:
+    NumberExprAST(double Val) : Val(Val) {}
 
-    public:
-        NumberExprAST(double Val) : Val(Val) {}
-    };
+    virtual Value * codegen();
+};
 
-    /// VariableExprAST - Expression class for referencing a variable, like "a".
-    class VariableExprAST : public ExprAST
-    {
-        std::string Name;
+/// VariableExprAST - Expression class for referencing a variable, like "a".
+class VariableExprAST : public ExprAST
+{
+    std::string Name;
 
-    public:
-        VariableExprAST(const std::string &Name) : Name(Name) {}
-    };
+public:
+    VariableExprAST(const std::string &Name) : Name(Name) {}
 
-    /// BinaryExprAST - Expression class for a binary operator.
-    class BinaryExprAST : public ExprAST
-    {
-        char Op;
-        std::unique_ptr<ExprAST> LHS, RHS;
+    virtual Value * codegen();
+};
 
-    public:
-        BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
-                      std::unique_ptr<ExprAST> RHS)
-            : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
-    };
+/// BinaryExprAST - Expression class for a binary operator.
+class BinaryExprAST : public ExprAST
+{
+    char Op;
+    std::unique_ptr<ExprAST> LHS, RHS;
 
-    /// CallExprAST - Expression class for function calls.
-    class CallExprAST : public ExprAST
-    {
-        std::string Callee;
-        std::vector<std::unique_ptr<ExprAST>> Args;
+public:
+    BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
+                    std::unique_ptr<ExprAST> RHS)
+        : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
 
-    public:
-        CallExprAST(const std::string &Callee,
-                    std::vector<std::unique_ptr<ExprAST>> Args)
-            : Callee(Callee), Args(std::move(Args)) {}
-    };
+    virtual Value * codegen();
+};
 
-    /// PrototypeAST - This class represents the "prototype" for a function,
-    /// which captures its name, and its argument names (thus implicitly the number
-    /// of arguments the function takes).
-    class PrototypeAST
-    {
-        std::string Name;
-        std::vector<std::string> Args;
+/// CallExprAST - Expression class for function calls.
+class CallExprAST : public ExprAST
+{
+    std::string Callee;
+    std::vector<std::unique_ptr<ExprAST>> Args;
 
-    public:
-        PrototypeAST(const std::string &Name, std::vector<std::string> Args)
-            : Name(Name), Args(std::move(Args)) {}
+public:
+    CallExprAST(const std::string &Callee,
+                std::vector<std::unique_ptr<ExprAST>> Args)
+        : Callee(Callee), Args(std::move(Args)) {}
 
-        const std::string &getName() const { return Name; }
-    };
+    virtual Value * codegen();
+};
 
-    /// FunctionAST - This class represents a function definition itself.
-    class FunctionAST
-    {
-        std::unique_ptr<PrototypeAST> Proto;
-        std::unique_ptr<ExprAST> Body;
+/// PrototypeAST - This class represents the "prototype" for a function,
+/// which captures its name, and its argument names (thus implicitly the number
+/// of arguments the function takes).
+class PrototypeAST
+{
+    std::string Name;
+    std::vector<std::string> Args;
 
-    public:
-        FunctionAST(std::unique_ptr<PrototypeAST> Proto,
-                    std::unique_ptr<ExprAST> Body)
-            : Proto(std::move(Proto)), Body(std::move(Body)) {}
-    };
+public:
+    PrototypeAST(const std::string &Name, std::vector<std::string> Args)
+        : Name(Name), Args(std::move(Args)) {}
 
-} // end anonymous namespace
+    const std::string &getName() const { return Name; }
+
+    virtual Function * codegen();
+};
+
+/// FunctionAST - This class represents a function definition itself.
+class FunctionAST
+{
+    std::unique_ptr<PrototypeAST> Proto;
+    std::unique_ptr<ExprAST> Body;
+
+public:
+    FunctionAST(std::unique_ptr<PrototypeAST> Proto,
+                std::unique_ptr<ExprAST> Body)
+        : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
+    virtual Function * codegen();
+};
 
 //===----------------------------------------------------------------------===//
 // Parser
@@ -403,14 +426,152 @@ static std::unique_ptr<PrototypeAST> ParseExtern()
 }
 
 //===----------------------------------------------------------------------===//
-// Top-Level parsing
+// Code Generation
 //===----------------------------------------------------------------------===//
+
+static std::unique_ptr<LLVMContext> TheContext;
+static std::unique_ptr<Module> TheModule;
+static std::unique_ptr<IRBuilder<>> Builder;
+static std::map<std::string, Value *> NamedValues;
+
+Value * LogErrorV(const char * str)
+{
+    LogError(str);
+    return nullptr;
+}
+
+Value * NumberExprAST::codegen()
+{
+    return ConstantFP::get(*TheContext, APFloat(Val));
+}
+
+Value * VariableExprAST::codegen()
+{
+    Value * v = NamedValues[Name];
+    if (!v)
+        return LogErrorV("Unknown variable name");
+    return v;
+}
+
+Value * BinaryExprAST::codegen()
+{
+    Value * l = LHS->codegen();
+    Value * r = RHS->codegen();
+
+    if (!l || !r)
+        return nullptr;
+
+    switch (Op)
+    {
+    case '+':
+        return Builder->CreateFAdd(l, r, "addtemp");
+
+    case '-':
+        return Builder->CreateFSub(l, r, "subtemp");
+
+    case '*':
+        return Builder->CreateFMul(l, r, "multemp");
+
+    case '<':
+        l = Builder->CreateFCmpULT(l, r, "cmptemp");
+        return Builder->CreateUIToFP(l, Type::getDoubleTy(*TheContext), "booltemp");
+
+    default:
+        return LogErrorV("invalid binary operation");
+    }
+}
+
+Value * CallExprAST::codegen()
+{
+    Function * calleeF = TheModule->getFunction(Callee);
+    if (!calleeF)
+        return LogErrorV("Unknown function referenced");
+
+    if (calleeF->arg_size() != Args.size())
+        return LogErrorV("Incorrect # arguments passed");
+
+    std::vector<Value *> argsV;
+    for (size_t i = 0u, e = Args.size(); i != e; ++i)
+    {
+        argsV.push_back(Args[i]->codegen());
+        if (!argsV.back())
+            return nullptr;
+    }
+
+    return Builder->CreateCall(calleeF, argsV, "calltmp");
+}
+
+Function * PrototypeAST::codegen()
+{
+    std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+
+    FunctionType * ft = FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+
+    Function * f = Function::Create(ft, Function::ExternalLinkage, Name, TheModule.get());
+
+    size_t idx = 0u;
+    for (auto & arg : f->args())
+        arg.setName(Args[idx++]);
+
+    return f;
+}
+
+Function * FunctionAST::codegen()
+{
+    Function * theFunction = TheModule->getFunction(Proto->getName());
+
+    if (!theFunction)
+        theFunction = Proto->codegen();
+
+    if (!theFunction)
+        return nullptr;
+
+    if (!theFunction->empty())
+        return (Function *)LogErrorV("Function cannot be redifined");
+
+    BasicBlock * bb = BasicBlock::Create(*TheContext, "entry", theFunction);
+    Builder->SetInsertPoint(bb);
+
+    NamedValues.clear();
+    for (auto & arg : theFunction->args())
+        NamedValues.insert(std::make_pair(arg.getName(), &arg));
+
+    Value* retVal = Body->codegen();
+    if (!retVal)
+    {
+        theFunction->eraseFromParent();
+        return nullptr;
+    }
+
+    Builder->CreateRet(retVal);
+
+    verifyFunction(*theFunction);
+
+    return theFunction;
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing and JIT Driver
+//===----------------------------------------------------------------------===//
+
+static void InitializeModule()
+{
+    TheContext = std::make_unique<LLVMContext>();
+    TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+
+    Builder = std::make_unique<IRBuilder<>>(*TheContext);
+}
 
 static void HandleDefinition()
 {
-    if (ParseDefinition())
+    if (auto FnAST = ParseDefinition())
     {
-        fprintf(stderr, "Parsed a function definition.\n");
+        if (auto * FnIR = FnAST->codegen())
+        {
+            fprintf(stderr, "Read function definition:\n");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+        }
     }
     else
     {
@@ -421,9 +582,14 @@ static void HandleDefinition()
 
 static void HandleExtern()
 {
-    if (ParseExtern())
+    if (auto ProtoAST = ParseExtern())
     {
-        fprintf(stderr, "Parsed an extern\n");
+        if (auto ProtoIR = ProtoAST->codegen())
+        {
+            fprintf(stderr, "Read extern:\n");
+            ProtoIR->print(errs());
+            fprintf(stderr, "\n");
+        }
     }
     else
     {
@@ -435,9 +601,16 @@ static void HandleExtern()
 static void HandleTopLevelExpression()
 {
     // Evaluate a top-level expression into an anonymous function.
-    if (ParseTopLevelExpr())
+    if (auto ExprAST = ParseTopLevelExpr())
     {
-        fprintf(stderr, "Parsed a top-level expr\n");
+        if (auto ExprIR = ExprAST->codegen())
+        {
+            fprintf(stderr, "Read top-level expression:\n");
+            ExprIR->print(errs());
+            fprintf(stderr, "\n");
+
+            ExprIR->eraseFromParent();
+        }
     }
     else
     {
@@ -489,8 +662,12 @@ int main()
     fprintf(stderr, "ready> ");
     getNextToken();
 
+    InitializeModule();
+
     // Run the main "interpreter loop" now.
     MainLoop();
+
+    TheModule->print(errs(), nullptr);
 
     return 0;
 }
