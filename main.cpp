@@ -1,3 +1,5 @@
+// https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html
+
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -14,10 +16,16 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Scalar/GVN.h>
 
 using namespace llvm;
 
@@ -431,6 +439,7 @@ static std::unique_ptr<PrototypeAST> ParseExtern()
 
 static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<Module> TheModule;
+static std::unique_ptr<legacy::FunctionPassManager> TheFPM;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::map<std::string, Value *> NamedValues;
 
@@ -547,6 +556,8 @@ Function * FunctionAST::codegen()
 
     verifyFunction(*theFunction);
 
+    TheFPM->run(*theFunction);
+
     return theFunction;
 }
 
@@ -554,10 +565,17 @@ Function * FunctionAST::codegen()
 // Top-Level parsing and JIT Driver
 //===----------------------------------------------------------------------===//
 
-static void InitializeModule()
+static void InitializeModuleAndPassManager()
 {
     TheContext = std::make_unique<LLVMContext>();
     TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+
+    TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
+
+    TheFPM->add(createInstructionCombiningPass());
+    TheFPM->add(createReassociatePass());
+    TheFPM->add(createGVNPass());
+    TheFPM->add(createCFGSimplificationPass());
 
     Builder = std::make_unique<IRBuilder<>>(*TheContext);
 }
@@ -662,7 +680,7 @@ int main()
     fprintf(stderr, "ready> ");
     getNextToken();
 
-    InitializeModule();
+    InitializeModuleAndPassManager();
 
     // Run the main "interpreter loop" now.
     MainLoop();
