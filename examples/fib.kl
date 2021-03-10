@@ -4,4 +4,4 @@ def fib(x)
     else
         fib(x - 1) + fib(x - 2)
 
-fib(40)
+fib(10)
